@@ -67,6 +67,58 @@ const getOrderBreakdown = (order) => {
   };
 };
 
+// Helper function to group and merge active orders by table and guest name
+const getMergedReadyOrders = (readyOrders) => {
+  const groups = {};
+  
+  readyOrders.forEach(order => {
+    const tableStr = (order.table_number || '').toString().trim();
+    const guestStr = (order.guest_name || '').toString().trim().toLowerCase();
+    const key = `${tableStr}_${guestStr}`;
+    
+    if (!groups[key]) {
+      groups[key] = {
+        id: order.id,
+        ids: [order.id],
+        table_number: order.table_number,
+        guest_name: order.guest_name,
+        created_at: order.created_at,
+        items: JSON.parse(JSON.stringify(order.items || [])), // Deep clone items list
+        total: order.total || 0,
+        order_nos: [order.order_no].filter(Boolean),
+        rawOrders: [order]
+      };
+    } else {
+      groups[key].ids.push(order.id);
+      if (order.order_no) {
+        groups[key].order_nos.push(order.order_no);
+      }
+      
+      // Merge items
+      const newItems = order.items || [];
+      newItems.forEach(newItem => {
+        const existingItem = groups[key].items.find(item => item.id === newItem.id);
+        if (existingItem) {
+          existingItem.quantity += newItem.quantity;
+        } else {
+          groups[key].items.push({ ...newItem });
+        }
+      });
+      
+      // Sum totals
+      groups[key].total += (order.total || 0);
+      
+      // Retain the earliest timestamp so waiters know who has been waiting longest
+      if (new Date(order.created_at) < new Date(groups[key].created_at)) {
+        groups[key].created_at = order.created_at;
+      }
+      groups[key].rawOrders.push(order);
+    }
+  });
+  
+  return Object.values(groups);
+};
+
 function App() {
   // Security Locks
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -178,24 +230,36 @@ function App() {
                 return [newRecord, ...prev];
               });
 
-              setSelectedOrderForSettle((prev) => 
-                prev && prev.id === newRecord.id ? null : prev
-              );
+              setSelectedOrderForSettle((prev) => {
+                if (!prev) return null;
+                const targetIds = prev.ids || [prev.id];
+                if (targetIds.includes(newRecord.id)) return null;
+                return prev;
+              });
             } else {
               setOrders((prev) =>
                 prev.map((o) => (o.id === newRecord.id ? newRecord : o))
               );
-              setSelectedOrderForSettle((prev) => 
-                prev && prev.id === newRecord.id ? newRecord : prev
-              );
+              setSelectedOrderForSettle((prev) => {
+                if (!prev) return null;
+                const targetIds = prev.ids || [prev.id];
+                if (targetIds.includes(newRecord.id)) {
+                  // If one of the orders in the selected group changes status, reset selection to avoid inconsistent total
+                  return null;
+                }
+                return prev;
+              });
             }
           } 
           else if (eventType === 'DELETE') {
             setOrders((prev) => prev.filter((o) => o.id !== oldRecord.id));
             setPaidOrders((prev) => prev.filter((o) => o.id !== oldRecord.id));
-            setSelectedOrderForSettle((prev) => 
-              prev && prev.id === oldRecord.id ? null : prev
-            );
+            setSelectedOrderForSettle((prev) => {
+              if (!prev) return null;
+              const targetIds = prev.ids || [prev.id];
+              if (targetIds.includes(oldRecord.id)) return null;
+              return prev;
+            });
           }
         }
       )
@@ -251,13 +315,14 @@ function App() {
   const settlePaymentAndDeliver = async (order) => {
     if (!order) return;
     try {
+      const targetIds = order.ids || [order.id];
       const { error } = await supabase
         .from('orders')
         .update({
           status: 'paid',
           payment_method: paymentMethod
         })
-        .eq('id', order.id);
+        .in('id', targetIds);
 
       if (error) throw error;
       setSelectedOrderForSettle(null);
@@ -840,70 +905,91 @@ function App() {
         {activeView === 'floor' && (
           <div className="floor-layout">
             
-            <div className="floor-cards-column">
-              <div className="column-header">
-                <h3 className="column-title">Ready for Delivery</h3>
-                <span className="column-count">{readyOrders.length}</span>
-              </div>
+            {(() => {
+              const mergedReadyOrders = getMergedReadyOrders(readyOrders);
+              return (
+                <div className="floor-cards-column">
+                  <div className="column-header">
+                    <h3 className="column-title">Ready for Delivery</h3>
+                    <span className="column-count">
+                      {mergedReadyOrders.length} {mergedReadyOrders.length === 1 ? 'Bill' : 'Bills'} ({readyOrders.length} {readyOrders.length === 1 ? 'order' : 'orders'})
+                    </span>
+                  </div>
 
-              {readyOrders.length === 0 ? (
-                <div className="floor-empty-state">
-                  <div className="floor-empty-icon">🍽️</div>
-                  <p>All clear! There are no orders awaiting table delivery right now.</p>
-                </div>
-              ) : (
-                <div className="floor-grid">
-                  {readyOrders.map((order) => {
-                    const isSelected = selectedOrderForSettle && selectedOrderForSettle.id === order.id;
-                    const { foodItems } = getOrderBreakdown(order);
-                    return (
-                      <div
-                        key={order.id}
-                        className="order-card"
-                        style={{
-                          borderColor: isSelected ? 'var(--accent-gold)' : 'var(--status-ready-border)',
-                          cursor: 'pointer'
-                        }}
-                        onClick={() => setSelectedOrderForSettle(order)}
-                      >
-                        <div className="order-card-header">
-                          <span className="order-table-label">Table {order.table_number}</span>
-                          <span className="order-time">
-                            {new Date(order.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                          </span>
-                        </div>
-                        <span className="order-guest-name">Guest: {order.guest_name}</span>
-                        
-                        <div className="order-items-list">
-                          {foodItems.map((item, idx) => (
-                            <div key={idx} className="order-item-desc">
-                              <span>{item.quantity}x {item.name}</span>
+                  {mergedReadyOrders.length === 0 ? (
+                    <div className="floor-empty-state">
+                      <div className="floor-empty-icon">🍽️</div>
+                      <p>All clear! There are no orders awaiting table delivery right now.</p>
+                    </div>
+                  ) : (
+                    <div className="floor-grid">
+                      {mergedReadyOrders.map((order) => {
+                        const isSelected = selectedOrderForSettle && selectedOrderForSettle.id === order.id;
+                        const { foodItems } = getOrderBreakdown(order);
+                        return (
+                          <div
+                            key={order.id}
+                            className="order-card"
+                            style={{
+                              borderColor: isSelected ? 'var(--accent-gold)' : 'var(--status-ready-border)',
+                              cursor: 'pointer'
+                            }}
+                            onClick={() => setSelectedOrderForSettle(order)}
+                          >
+                            <div className="order-card-header">
+                              <span className="order-table-label">Table {order.table_number}</span>
+                              <span className="order-time">
+                                {new Date(order.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                              </span>
                             </div>
-                          ))}
-                        </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                              <span className="order-guest-name" style={{ border: 'none', padding: 0 }}>Guest: {order.guest_name}</span>
+                              {order.ids.length > 1 && (
+                                <span style={{ 
+                                  fontSize: '10px', 
+                                  backgroundColor: 'var(--accent-gold)', 
+                                  color: 'var(--bg-dashboard)', 
+                                  padding: '2px 6px', 
+                                  borderRadius: '4px',
+                                  fontWeight: 'bold' 
+                                }}>
+                                  Merged ({order.ids.length})
+                                </span>
+                              )}
+                            </div>
+                            
+                            <div className="order-items-list" style={{ marginTop: '8px' }}>
+                              {foodItems.map((item, idx) => (
+                                <div key={idx} className="order-item-desc">
+                                  <span>{item.quantity}x {item.name}</span>
+                                </div>
+                              ))}
+                            </div>
 
-                        <div className="order-card-pricing">
-                          <span>Total to Settle:</span>
-                          <span className="order-total">${order.total?.toFixed(2)}</span>
-                        </div>
+                            <div className="order-card-pricing">
+                              <span>Total to Settle:</span>
+                              <span className="order-total">${order.total?.toFixed(2)}</span>
+                            </div>
 
-                        <button
-                          className="btn-card-action"
-                          style={{
-                            backgroundColor: isSelected ? 'var(--accent-gold)' : 'var(--bg-panel)',
-                            color: isSelected ? 'var(--bg-dashboard)' : 'var(--accent-gold)',
-                            border: '1px solid var(--accent-gold)',
-                            marginTop: '8px'
-                          }}
-                        >
-                          {isSelected ? 'Selected' : 'Select for Settlement'}
-                        </button>
-                      </div>
-                    );
-                  })}
+                            <button
+                              className="btn-card-action"
+                              style={{
+                                backgroundColor: isSelected ? 'var(--accent-gold)' : 'var(--bg-panel)',
+                                color: isSelected ? 'var(--bg-dashboard)' : 'var(--accent-gold)',
+                                border: '1px solid var(--accent-gold)',
+                                marginTop: '8px'
+                              }}
+                            >
+                              {isSelected ? 'Selected' : 'Select for Settlement'}
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
+              );
+            })()}
 
             {/* Settle Order Panel */}
             <div className="settlement-panel">
