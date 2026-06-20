@@ -67,56 +67,93 @@ const getOrderBreakdown = (order) => {
   };
 };
 
-// Helper function to group and merge active orders by table and guest name
-const getMergedReadyOrders = (readyOrders) => {
-  const groups = {};
+// Check if two orders/groups should be merged based on guest, table, and time-based meal completion
+const shouldMergeOrders = (group, order) => {
+  if ((group.table_number || '').toString().trim() !== (order.table_number || '').toString().trim() ||
+      (group.guest_name || '').toString().trim().toLowerCase() !== (order.guest_name || '').toString().trim().toLowerCase()) {
+    return false;
+  }
+
+  const orderCreatedTime = new Date(order.created_at).getTime();
+
+  // If any previous order in the group was already completed (marked ready/paid) before this order was placed, keep them separate
+  const hasAlreadyCompletedMeal = group.rawOrders.some(prevOrder => {
+    if (prevOrder.status === 'ready' || prevOrder.status === 'paid') {
+      const prevCompletedTime = new Date(prevOrder.updated_at).getTime();
+      // Add a small grace threshold of 10 seconds just in case timestamps are extremely close
+      if (orderCreatedTime > prevCompletedTime + 10000) {
+        return true;
+      }
+    }
+    return false;
+  });
+
+  if (hasAlreadyCompletedMeal) {
+    return false;
+  }
+
+  return true;
+};
+
+// Generic order grouping & merging function
+const getMergedOrdersList = (ordersList) => {
+  const merged = [];
   
-  readyOrders.forEach(order => {
-    const tableStr = (order.table_number || '').toString().trim();
-    const guestStr = (order.guest_name || '').toString().trim().toLowerCase();
-    const key = `${tableStr}_${guestStr}`;
+  ordersList.forEach(order => {
+    const group = merged.find(g => shouldMergeOrders(g, order));
     
-    if (!groups[key]) {
-      groups[key] = {
+    if (!group) {
+      merged.push({
         id: order.id,
         ids: [order.id],
         table_number: order.table_number,
         guest_name: order.guest_name,
         created_at: order.created_at,
-        items: JSON.parse(JSON.stringify(order.items || [])), // Deep clone items list
+        updated_at: order.updated_at,
+        items: JSON.parse(JSON.stringify(order.items || [])),
         total: order.total || 0,
+        order_no: order.order_no,
         order_nos: [order.order_no].filter(Boolean),
+        status: order.status,
         rawOrders: [order]
-      };
+      });
     } else {
-      groups[key].ids.push(order.id);
+      group.ids.push(order.id);
       if (order.order_no) {
-        groups[key].order_nos.push(order.order_no);
+        group.order_nos.push(order.order_no);
       }
       
-      // Merge items
+      // Merge items list
       const newItems = order.items || [];
       newItems.forEach(newItem => {
-        const existingItem = groups[key].items.find(item => item.id === newItem.id);
+        const existingItem = group.items.find(item => item.id === newItem.id);
         if (existingItem) {
           existingItem.quantity += newItem.quantity;
         } else {
-          groups[key].items.push({ ...newItem });
+          group.items.push({ ...newItem });
         }
       });
       
       // Sum totals
-      groups[key].total += (order.total || 0);
+      group.total += (order.total || 0);
       
-      // Retain the earliest timestamp so waiters know who has been waiting longest
-      if (new Date(order.created_at) < new Date(groups[key].created_at)) {
-        groups[key].created_at = order.created_at;
+      // Retain earliest created_at
+      if (new Date(order.created_at) < new Date(group.created_at)) {
+        group.created_at = order.created_at;
       }
-      groups[key].rawOrders.push(order);
+      // Retain latest updated_at
+      if (new Date(order.updated_at) > new Date(group.updated_at)) {
+        group.updated_at = order.updated_at;
+      }
+      group.rawOrders.push(order);
     }
   });
   
-  return Object.values(groups);
+  return merged;
+};
+
+const getMergedReadyOrders = (readyOrders) => {
+  return getMergedOrdersList(readyOrders);
 };
 
 function App() {
@@ -299,12 +336,16 @@ function App() {
     }
   }, [activeView, isAuthenticated]);
 
-  const updateOrderStatus = async (orderId, nextStatus) => {
+  const updateOrderStatus = async (orderIdOrIds, nextStatus) => {
     try {
+      const targetIds = Array.isArray(orderIdOrIds) ? orderIdOrIds : [orderIdOrIds];
       const { error } = await supabase
         .from('orders')
-        .update({ status: nextStatus })
-        .eq('id', orderId);
+        .update({ 
+          status: nextStatus,
+          updated_at: new Date().toISOString()
+        })
+        .in('id', targetIds);
 
       if (error) throw error;
     } catch (err) {
@@ -320,7 +361,8 @@ function App() {
         .from('orders')
         .update({
           status: 'paid',
-          payment_method: paymentMethod
+          payment_method: paymentMethod,
+          updated_at: new Date().toISOString()
         })
         .in('id', targetIds);
 
@@ -962,180 +1004,228 @@ function App() {
         )}
 
         {/* 1. KITCHEN KANBAN VIEW */}
-        {activeView === 'kitchen' && (
-          <div className="kanban-grid">
+        {activeView === 'kitchen' && (() => {
+            const mergedNewOrders = getMergedOrdersList(newOrders);
+            const mergedPreparingOrders = getMergedOrdersList(preparingOrders);
+            const mergedReadyOrders = getMergedOrdersList(readyOrders);
             
-            {/* COLUMN: NEW */}
-            <div className="kanban-column">
-              <div className="column-header">
-                <h3 className="column-title">
-                  <span className="badge-new">●</span> New Orders
-                </h3>
-                <span className="column-count">{newOrders.length}</span>
-              </div>
-              <div className="column-cards-container">
-                {newOrders.length === 0 ? (
-                  <p style={{ color: 'var(--text-muted)', fontSize: '13px', textAlign: 'center', marginTop: '20px' }}>
-                    No pending new orders
-                  </p>
-                ) : (
-                  newOrders.map((order) => {
-                    const { foodItems } = getOrderBreakdown(order);
-                    return (
-                      <div
-                        key={order.id}
-                        className={`order-card ${newOrderIds.has(order.id) ? 'is-new-flash' : ''}`}
-                      >
-                        <div className="order-card-header">
-                          <span className="order-table-label">T-{order.table_number}</span>
-                          <span className="order-time">
-                            {new Date(order.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                          </span>
-                        </div>
-                        <span className="order-guest-name">Guest: {order.guest_name}</span>
-                        
-                        <div className="order-items-list">
-                          {foodItems.map((item, idx) => (
-                            <div key={idx} className="order-item-desc">
-                              <span>
-                                <span className="order-item-qty">{item.quantity}x</span>
-                                {item.name}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-
-                        <div className="order-card-pricing">
-                          <span>Items: {foodItems.reduce((s, i) => s + i.quantity, 0)}</span>
-                          <span className="order-total">Total: ${order.total?.toFixed(2)}</span>
-                        </div>
-
-                        <div className="order-card-actions">
-                          <button
-                            className="btn-card-action start-prep"
-                            onClick={() => updateOrderStatus(order.id, 'preparing')}
+            return (
+              <div className="kanban-grid">
+                
+                {/* COLUMN: NEW */}
+                <div className="kanban-column">
+                  <div className="column-header">
+                    <h3 className="column-title">
+                      <span className="badge-new">●</span> New Orders
+                    </h3>
+                    <span className="column-count">{mergedNewOrders.length}</span>
+                  </div>
+                  <div className="column-cards-container">
+                    {mergedNewOrders.length === 0 ? (
+                      <p style={{ color: 'var(--text-muted)', fontSize: '13px', textAlign: 'center', marginTop: '20px' }}>
+                        No pending new orders
+                      </p>
+                    ) : (
+                      mergedNewOrders.map((order) => {
+                        const { foodItems } = getOrderBreakdown(order);
+                        return (
+                          <div
+                            key={order.id}
+                            className={`order-card ${newOrderIds.has(order.id) ? 'is-new-flash' : ''}`}
                           >
-                            🍳 Start Prep
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })
-                )}
-              </div>
-            </div>
-
-            {/* COLUMN: PREPARING */}
-            <div className="kanban-column">
-              <div className="column-header">
-                <h3 className="column-title">
-                  <span className="badge-preparing">●</span> Preparing
-                </h3>
-                <span className="column-count">{preparingOrders.length}</span>
-              </div>
-              <div className="column-cards-container">
-                {preparingOrders.length === 0 ? (
-                  <p style={{ color: 'var(--text-muted)', fontSize: '13px', textAlign: 'center', marginTop: '20px' }}>
-                    No orders being prepared
-                  </p>
-                ) : (
-                  preparingOrders.map((order) => {
-                    const { foodItems } = getOrderBreakdown(order);
-                    return (
-                      <div key={order.id} className="order-card">
-                        <div className="order-card-header">
-                          <span className="order-table-label">T-{order.table_number}</span>
-                          <span className="order-time">
-                            {new Date(order.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                          </span>
-                        </div>
-                        <span className="order-guest-name">Guest: {order.guest_name}</span>
-                        
-                        <div className="order-items-list">
-                          {foodItems.map((item, idx) => (
-                            <div key={idx} className="order-item-desc">
-                              <span>
-                                <span className="order-item-qty">{item.quantity}x</span>
-                                {item.name}
+                            <div className="order-card-header">
+                              <span className="order-table-label">T-{order.table_number}</span>
+                              <span className="order-time">
+                                {new Date(order.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                               </span>
                             </div>
-                          ))}
-                        </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px dashed var(--border-color)', paddingBottom: '6px' }}>
+                              <span className="order-guest-name" style={{ border: 'none', padding: 0 }}>Guest: {order.guest_name}</span>
+                              {order.ids.length > 1 && (
+                                <span style={{ 
+                                  fontSize: '10px', 
+                                  backgroundColor: 'var(--accent-gold)', 
+                                  color: 'var(--bg-dashboard)', 
+                                  padding: '2px 6px', 
+                                  borderRadius: '4px',
+                                  fontWeight: 'bold' 
+                                }}>
+                                  Merged ({order.ids.length})
+                                </span>
+                              )}
+                            </div>
+                            
+                            <div className="order-items-list" style={{ marginTop: '4px' }}>
+                              {foodItems.map((item, idx) => (
+                                <div key={idx} className="order-item-desc">
+                                  <span>
+                                    <span className="order-item-qty">{item.quantity}x</span>
+                                    {item.name}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
 
-                        <div className="order-card-pricing">
-                          <span>Items: {foodItems.reduce((s, i) => s + i.quantity, 0)}</span>
-                          <span className="order-total">Total: ${order.total?.toFixed(2)}</span>
-                        </div>
+                            <div className="order-card-pricing">
+                              <span>Items: {foodItems.reduce((s, i) => s + i.quantity, 0)}</span>
+                              <span className="order-total">Total: ${order.total?.toFixed(2)}</span>
+                            </div>
 
-                        <div className="order-card-actions">
-                          <button
-                            className="btn-card-action mark-ready"
-                            onClick={() => updateOrderStatus(order.id, 'ready')}
-                          >
-                            ✓ Mark Ready
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })
-                )}
-              </div>
-            </div>
+                            <div className="order-card-actions">
+                              <button
+                                className="btn-card-action start-prep"
+                                onClick={() => updateOrderStatus(order.ids || order.id, 'preparing')}
+                              >
+                                🍳 Start Prep
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
 
-            {/* COLUMN: READY */}
-            <div className="kanban-column">
-              <div className="column-header">
-                <h3 className="column-title">
-                  <span className="badge-ready">●</span> Ready to Deliver
-                </h3>
-                <span className="column-count">{readyOrders.length}</span>
-              </div>
-              <div className="column-cards-container">
-                {readyOrders.length === 0 ? (
-                  <p style={{ color: 'var(--text-muted)', fontSize: '13px', textAlign: 'center', marginTop: '20px' }}>
-                    No meals currently ready
-                  </p>
-                ) : (
-                  readyOrders.map((order) => {
-                    const { foodItems } = getOrderBreakdown(order);
-                    return (
-                      <div key={order.id} className="order-card" style={{ borderColor: 'var(--status-ready-border)' }}>
-                        <div className="order-card-header">
-                          <span className="order-table-label">T-{order.table_number}</span>
-                          <span className="order-time">
-                            {new Date(order.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                          </span>
-                        </div>
-                        <span className="order-guest-name">Guest: {order.guest_name}</span>
-                        
-                        <div className="order-items-list">
-                          {foodItems.map((item, idx) => (
-                            <div key={idx} className="order-item-desc">
-                              <span>
-                                <span className="order-item-qty">{item.quantity}x</span>
-                                {item.name}
+                {/* COLUMN: PREPARING */}
+                <div className="kanban-column">
+                  <div className="column-header">
+                    <h3 className="column-title">
+                      <span className="badge-preparing">●</span> Preparing
+                    </h3>
+                    <span className="column-count">{mergedPreparingOrders.length}</span>
+                  </div>
+                  <div className="column-cards-container">
+                    {mergedPreparingOrders.length === 0 ? (
+                      <p style={{ color: 'var(--text-muted)', fontSize: '13px', textAlign: 'center', marginTop: '20px' }}>
+                        No orders being prepared
+                      </p>
+                    ) : (
+                      mergedPreparingOrders.map((order) => {
+                        const { foodItems } = getOrderBreakdown(order);
+                        return (
+                          <div key={order.id} className="order-card">
+                            <div className="order-card-header">
+                              <span className="order-table-label">T-{order.table_number}</span>
+                              <span className="order-time">
+                                {new Date(order.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                               </span>
                             </div>
-                          ))}
-                        </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px dashed var(--border-color)', paddingBottom: '6px' }}>
+                              <span className="order-guest-name" style={{ border: 'none', padding: 0 }}>Guest: {order.guest_name}</span>
+                              {order.ids.length > 1 && (
+                                <span style={{ 
+                                  fontSize: '10px', 
+                                  backgroundColor: 'var(--accent-gold)', 
+                                  color: 'var(--bg-dashboard)', 
+                                  padding: '2px 6px', 
+                                  borderRadius: '4px',
+                                  fontWeight: 'bold' 
+                                }}>
+                                  Merged ({order.ids.length})
+                                </span>
+                              )}
+                            </div>
+                            
+                            <div className="order-items-list" style={{ marginTop: '4px' }}>
+                              {foodItems.map((item, idx) => (
+                                <div key={idx} className="order-item-desc">
+                                  <span>
+                                    <span className="order-item-qty">{item.quantity}x</span>
+                                    {item.name}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
 
-                        <div className="order-card-pricing">
-                          <span>Items: {foodItems.reduce((s, i) => s + i.quantity, 0)}</span>
-                          <span className="order-total">Total: ${order.total?.toFixed(2)}</span>
-                        </div>
+                            <div className="order-card-pricing">
+                              <span>Items: {foodItems.reduce((s, i) => s + i.quantity, 0)}</span>
+                              <span className="order-total">Total: ${order.total?.toFixed(2)}</span>
+                            </div>
 
-                        <p style={{ fontSize: '11px', color: 'var(--accent-cyan)', textAlign: 'center', fontWeight: '600' }}>
-                          Waiting for Floor Pickup
-                        </p>
-                      </div>
-                    );
-                  })
-                )}
+                            <div className="order-card-actions">
+                              <button
+                                className="btn-card-action mark-ready"
+                                onClick={() => updateOrderStatus(order.ids || order.id, 'ready')}
+                              >
+                                ✓ Mark Ready
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+
+                {/* COLUMN: READY */}
+                <div className="kanban-column">
+                  <div className="column-header">
+                    <h3 className="column-title">
+                      <span className="badge-ready">●</span> Ready to Deliver
+                    </h3>
+                    <span className="column-count">{mergedReadyOrders.length}</span>
+                  </div>
+                  <div className="column-cards-container">
+                    {mergedReadyOrders.length === 0 ? (
+                      <p style={{ color: 'var(--text-muted)', fontSize: '13px', textAlign: 'center', marginTop: '20px' }}>
+                        No meals currently ready
+                      </p>
+                    ) : (
+                      mergedReadyOrders.map((order) => {
+                        const { foodItems } = getOrderBreakdown(order);
+                        return (
+                          <div key={order.id} className="order-card" style={{ borderColor: 'var(--status-ready-border)' }}>
+                            <div className="order-card-header">
+                              <span className="order-table-label">T-{order.table_number}</span>
+                              <span className="order-time">
+                                {new Date(order.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                              </span>
+                            </div>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderBottom: '1px dashed var(--border-color)', paddingBottom: '6px' }}>
+                              <span className="order-guest-name" style={{ border: 'none', padding: 0 }}>Guest: {order.guest_name}</span>
+                              {order.ids.length > 1 && (
+                                <span style={{ 
+                                  fontSize: '10px', 
+                                  backgroundColor: 'var(--accent-gold)', 
+                                  color: 'var(--bg-dashboard)', 
+                                  padding: '2px 6px', 
+                                  borderRadius: '4px',
+                                  fontWeight: 'bold' 
+                                }}>
+                                  Merged ({order.ids.length})
+                                </span>
+                              )}
+                            </div>
+                            
+                            <div className="order-items-list" style={{ marginTop: '4px' }}>
+                              {foodItems.map((item, idx) => (
+                                <div key={idx} className="order-item-desc">
+                                  <span>
+                                    <span className="order-item-qty">{item.quantity}x</span>
+                                    {item.name}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+
+                            <div className="order-card-pricing">
+                              <span>Items: {foodItems.reduce((s, i) => s + i.quantity, 0)}</span>
+                              <span className="order-total">Total: ${order.total?.toFixed(2)}</span>
+                            </div>
+
+                            <p style={{ fontSize: '11px', color: 'var(--accent-cyan)', textAlign: 'center', fontWeight: '600' }}>
+                              Waiting for Floor Pickup
+                            </p>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+
               </div>
-            </div>
-
-          </div>
-        )}
+            );
+          })()}
 
         {/* 2. FLOOR / WAITER DELIVERY VIEW */}
         {activeView === 'floor' && (
