@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { supabase } from './supabaseClient';
+import { jsPDF } from 'jspdf';
+import autoTable from 'jspdf-autotable';
 import './App.css';
 
 // Worker secret passcode (checks env variable or defaults to NOIR123)
@@ -68,11 +70,12 @@ const getOrderBreakdown = (order) => {
 function App() {
   // Security Locks
   const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false);
   const [passcodeBuffer, setPasscodeBuffer] = useState('');
   const [authError, setAuthError] = useState('');
 
   // Dashboard state
-  const [activeView, setActiveView] = useState('kitchen'); // 'kitchen', 'floor', 'history'
+  const [activeView, setActiveView] = useState('kitchen'); // 'kitchen', 'floor', 'history', 'admin'
   const [orders, setOrders] = useState([]);
   const [paidOrders, setPaidOrders] = useState([]); // populated when history tab is loaded
   const [dbConnected, setDbConnected] = useState(true);
@@ -83,14 +86,28 @@ function App() {
   
   const [newOrderAlert, setNewOrderAlert] = useState(null);
   const [newOrderIds, setNewOrderIds] = useState(new Set());
+
+  // Admin / Manager panel state
+  const [showAdminUnlockModal, setShowAdminUnlockModal] = useState(false);
+  const [adminUnlockBuffer, setAdminUnlockBuffer] = useState('');
+  const [adminUnlockError, setAdminUnlockError] = useState('');
+  const [showClearConfirmModal, setShowClearConfirmModal] = useState(false);
+  const [clearConfirmType, setClearConfirmType] = useState('paid'); // 'paid' or 'all'
+  const [clearConfirmInput, setClearConfirmInput] = useState('');
+  const [adminError, setAdminError] = useState('');
+  const [isClearing, setIsClearing] = useState(false);
   
   const initialFetchDone = useRef(false);
 
   // Check login on load
   useEffect(() => {
     const isLogged = localStorage.getItem('noir_dashboard_auth') === 'true';
+    const isAdminLogged = localStorage.getItem('noir_dashboard_admin') === 'true';
     if (isLogged) {
       setIsAuthenticated(true);
+      if (isAdminLogged) {
+        setIsAdmin(true);
+      }
     }
   }, []);
 
@@ -263,9 +280,18 @@ function App() {
 
   const handleVerifyPasscode = (e) => {
     if (e) e.preventDefault();
-    if (passcodeBuffer === STAFF_PASSCODE) {
+    if (passcodeBuffer === '718285') {
       setIsAuthenticated(true);
+      setIsAdmin(true);
       localStorage.setItem('noir_dashboard_auth', 'true');
+      localStorage.setItem('noir_dashboard_admin', 'true');
+      setPasscodeBuffer('');
+      setAuthError('');
+    } else if (passcodeBuffer === STAFF_PASSCODE) {
+      setIsAuthenticated(true);
+      setIsAdmin(false);
+      localStorage.setItem('noir_dashboard_auth', 'true');
+      localStorage.removeItem('noir_dashboard_admin');
       setPasscodeBuffer('');
       setAuthError('');
     } else {
@@ -276,8 +302,191 @@ function App() {
 
   const handleLockOut = () => {
     setIsAuthenticated(false);
+    setIsAdmin(false);
     localStorage.removeItem('noir_dashboard_auth');
+    localStorage.removeItem('noir_dashboard_admin');
     setActiveView('kitchen');
+  };
+
+  const handleUnlockAdmin = (e) => {
+    if (e) e.preventDefault();
+    if (adminUnlockBuffer === '718285') {
+      setIsAdmin(true);
+      localStorage.setItem('noir_dashboard_admin', 'true');
+      setShowAdminUnlockModal(false);
+      setAdminUnlockBuffer('');
+      setAdminUnlockError('');
+      setActiveView('admin');
+    } else {
+      setAdminUnlockError('Incorrect Admin Passcode.');
+      setAdminUnlockBuffer('');
+    }
+  };
+
+  const handleAdminKeypadPress = (val) => {
+    setAdminUnlockError('');
+    if (adminUnlockBuffer.length >= 8) return;
+    setAdminUnlockBuffer((prev) => prev + val);
+  };
+
+  const handleClearAdminPasscode = () => {
+    setAdminUnlockBuffer('');
+    setAdminUnlockError('');
+  };
+
+  const handleClearDatabase = async () => {
+    if (clearConfirmInput !== 'CLEAR') {
+      setAdminError('Please type CLEAR to confirm.');
+      return;
+    }
+    
+    setIsClearing(true);
+    setAdminError('');
+    try {
+      if (clearConfirmType === 'paid') {
+        const { error } = await supabase
+          .from('orders')
+          .delete()
+          .eq('status', 'paid');
+        if (error) throw error;
+        setPaidOrders([]);
+      } else {
+        const { error } = await supabase
+          .from('orders')
+          .delete()
+          .neq('id', '00000000-0000-0000-0000-000000000000');
+        if (error) throw error;
+        setOrders([]);
+        setPaidOrders([]);
+        setSelectedOrderForSettle(null);
+      }
+      setShowClearConfirmModal(false);
+      setClearConfirmInput('');
+    } catch (err) {
+      console.error('Error clearing data:', err);
+      setAdminError(`Database Error: ${err.message}. If this is a permission error, ensure you have enabled a DELETE RLS policy on the public.orders table in Supabase.`);
+    } finally {
+      setIsClearing(false);
+    }
+  };
+
+  const handleDownloadPDF = () => {
+    try {
+      const doc = new jsPDF();
+      
+      // Page styling: Dark Header mimicking the elegant Noir restaurant aesthetic
+      doc.setFillColor(28, 26, 23); // Deep charcoal
+      doc.rect(0, 0, 210, 42, 'F');
+      
+      doc.setTextColor(197, 168, 128); // Gold color
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(28);
+      doc.text('NOIR', 15, 22);
+      
+      doc.setTextColor(255, 255, 255);
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(10);
+      doc.text('Fulfillment & Sales Ledger Report', 15, 30);
+      
+      doc.setTextColor(142, 117, 84); // Muted gold
+      doc.text(`Generated on: ${new Date().toLocaleString()}`, 130, 30);
+      
+      // Summary Metrics Calculations
+      const totalRevenue = paidOrders.reduce((sum, o) => {
+        const { total } = getOrderBreakdown(o);
+        return sum + total;
+      }, 0);
+      
+      const totalTips = paidOrders.reduce((sum, o) => {
+        const { tipAmount } = getOrderBreakdown(o);
+        return sum + tipAmount;
+      }, 0);
+      
+      const netRevenue = totalRevenue - totalTips;
+      
+      const totalItemsPrepared = paidOrders.reduce((sum, o) => {
+        const { foodItems } = getOrderBreakdown(o);
+        return sum + foodItems.reduce((s, i) => s + i.quantity, 0);
+      }, 0);
+      
+      // Financial Summary Block
+      doc.setTextColor(28, 26, 23);
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(12);
+      doc.text('FINANCIAL SUMMARY', 15, 52);
+      
+      doc.setDrawColor(197, 168, 128);
+      doc.setLineWidth(0.5);
+      doc.line(15, 55, 195, 55);
+      
+      autoTable(doc, {
+        startY: 58,
+        theme: 'plain',
+        styles: { fontSize: 10, cellPadding: 4, textColor: [44, 40, 35] },
+        body: [
+          ['Total Completed Sales:', `${paidOrders.length} Orders`, 'Active Pending Orders:', `${orders.length} Orders`],
+          ['Gross Revenue (incl. Tips):', `$${totalRevenue.toFixed(2)}`, 'Tips Collected:', `$${totalTips.toFixed(2)}`],
+          ['Net Product Revenue:', `$${netRevenue.toFixed(2)}`, 'Total Items Sold:', `${totalItemsPrepared} items`]
+        ],
+        columnStyles: {
+          0: { fontStyle: 'bold', width: 50 },
+          1: { width: 45 },
+          2: { fontStyle: 'bold', width: 45 },
+          3: { width: 45 }
+        }
+      });
+      
+      // Detailed Ledger Table Header
+      const nextY = doc.lastAutoTable.finalY + 12;
+      doc.text('DETAILED TRANSACTION LEDGER', 15, nextY);
+      doc.line(15, nextY + 3, 195, nextY + 3);
+      
+      // Prepare table data
+      const tableRows = paidOrders.map((order) => {
+        const { foodItems, tipAmount, total } = getOrderBreakdown(order);
+        const dateStr = new Date(order.created_at).toLocaleDateString();
+        const timeStr = new Date(order.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        
+        const itemsStr = foodItems
+          .map((item) => `${item.quantity}x ${item.name}`)
+          .join(', ');
+          
+        return [
+          `${dateStr} ${timeStr}`,
+          order.order_no || 'N/A',
+          `Table ${order.table_number}`,
+          order.guest_name,
+          itemsStr,
+          `$${tipAmount.toFixed(2)}`,
+          `$${total.toFixed(2)}`,
+          order.payment_method === 'cash' ? 'Cash' : 'Card'
+        ];
+      });
+      
+      autoTable(doc, {
+        startY: nextY + 6,
+        head: [['Time', 'Order #', 'Table', 'Guest', 'Items', 'Tip', 'Total', 'Payment']],
+        body: tableRows,
+        theme: 'striped',
+        headStyles: { fillColor: [28, 26, 23], textColor: [197, 168, 128], fontSize: 9 },
+        bodyStyles: { fontSize: 8, textColor: [28, 26, 23] },
+        columnStyles: {
+          0: { cellWidth: 28 },
+          1: { cellWidth: 15 },
+          2: { cellWidth: 15 },
+          3: { cellWidth: 20 },
+          4: { cellWidth: 62 },
+          5: { cellWidth: 15 },
+          6: { cellWidth: 15 },
+          7: { cellWidth: 15 }
+        }
+      });
+      
+      doc.save(`noir_sales_report_${new Date().toISOString().split('T')[0]}.pdf`);
+    } catch (err) {
+      console.error('Failed to generate PDF:', err);
+      alert('Failed to generate PDF. Check console for details.');
+    }
   };
 
   // Math aggregates for Sales Tab
@@ -398,13 +607,38 @@ function App() {
           >
             📊 Sales History
           </button>
+          {isAdmin && (
+            <button
+              className={`nav-tab ${activeView === 'admin' ? 'active' : ''}`}
+              onClick={() => {
+                setActiveView('admin');
+                setSelectedOrderForSettle(null);
+              }}
+            >
+              🔐 Admin Console
+            </button>
+          )}
         </nav>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
           <div className="connection-status">
             <span className={`status-dot ${dbConnected ? '' : 'disconnected'}`}></span>
             <span>{dbConnected ? 'SYNCED' : 'OFFLINE'}</span>
           </div>
+          {!isAdmin ? (
+            <button 
+              className="lock-out-btn admin-unlock-btn" 
+              onClick={() => {
+                setAdminUnlockBuffer('');
+                setAdminUnlockError('');
+                setShowAdminUnlockModal(true);
+              }}
+            >
+              🔑 Unlock Admin
+            </button>
+          ) : (
+            <span className="admin-status-badge">MANAGER MODE</span>
+          )}
           <button className="lock-out-btn" onClick={handleLockOut}>
             🔐 Lock Panel
           </button>
@@ -855,7 +1089,203 @@ function App() {
           </div>
         )}
 
+        {/* 4. ADMIN CONSOLE VIEW */}
+        {activeView === 'admin' && isAdmin && (
+          <div className="admin-layout">
+            <div className="admin-section-header">
+              <h2 className="admin-title">Manager Vault & Operations</h2>
+              <p className="admin-subtitle">Secure administrative actions for Noir Restaurant. Credentials authenticated.</p>
+            </div>
+            
+            <div className="admin-grid-panels">
+              {/* Reports Panel */}
+              <div className="admin-panel-card">
+                <div className="panel-card-icon">📊</div>
+                <h3>Financial & Sales Reports</h3>
+                <p>Compile current transaction records, total tips, products sold, and gross revenue metrics into a formatted PDF document.</p>
+                <button 
+                  className="admin-action-btn pdf-btn"
+                  onClick={handleDownloadPDF}
+                  disabled={paidOrders.length === 0}
+                >
+                  📥 Download PDF Ledger
+                </button>
+                {paidOrders.length === 0 && (
+                  <span className="panel-note-warning">Note: No completed transactions in history to report.</span>
+                )}
+              </div>
+
+              {/* Data Cleansing Panel */}
+              <div className="admin-panel-card danger">
+                <div className="panel-card-icon">⚠️</div>
+                <h3>Data Management & Purge</h3>
+                <p>Reset local transaction ledgers or clear standard customer queue listings to prepare for a new service shift.</p>
+                
+                <div className="purge-actions">
+                  <button 
+                    className="admin-action-btn clear-btn"
+                    onClick={() => {
+                      setClearConfirmType('paid');
+                      setClearConfirmInput('');
+                      setAdminError('');
+                      setShowClearConfirmModal(true);
+                    }}
+                  >
+                    🧹 Clear Paid Sales History
+                  </button>
+                  <button 
+                    className="admin-action-btn clear-all-btn"
+                    onClick={() => {
+                      setClearConfirmType('all');
+                      setClearConfirmInput('');
+                      setAdminError('');
+                      setShowClearConfirmModal(true);
+                    }}
+                  >
+                    🔥 Purge All Orders (Total Reset)
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Quick Metrics Summary */}
+            <div className="admin-metrics-summary">
+              <div className="admin-metric-item">
+                <span className="summary-label">Total Transactions Logged</span>
+                <span className="summary-val">{paidOrders.length}</span>
+              </div>
+              <div className="admin-metric-item">
+                <span className="summary-label">Active Queue Orders</span>
+                <span className="summary-val">{orders.length}</span>
+              </div>
+              <div className="admin-metric-item">
+                <span className="summary-label">Gross Revenue Pool</span>
+                <span className="summary-val">${totalRevenue.toFixed(2)}</span>
+              </div>
+              <div className="admin-metric-item">
+                <span className="summary-label">Tip Pool Share</span>
+                <span className="summary-val">${totalTips.toFixed(2)}</span>
+              </div>
+            </div>
+          </div>
+        )}
+
       </main>
+
+      {/* 1. ADMIN CODE UNLOCK MODAL */}
+      {showAdminUnlockModal && (
+        <div className="modal-overlay">
+          <div className="modal-card lock-card">
+            <div className="modal-close-header">
+              <span className="lock-logo" style={{ fontSize: '20px', margin: 0 }}>Noir Admin</span>
+              <button className="modal-close-x" onClick={() => setShowAdminUnlockModal(false)}>×</button>
+            </div>
+            <div className="lock-subtitle" style={{ marginBottom: '20px' }}>Enter Special Manager Passcode</div>
+            
+            <form onSubmit={handleUnlockAdmin}>
+              <div className="passcode-dots-row" style={{ marginBottom: '20px' }}>
+                {[...Array(6)].map((_, i) => (
+                  <div
+                    key={i}
+                    className={`passcode-dot ${i < adminUnlockBuffer.length ? 'filled' : ''}`}
+                  ></div>
+                ))}
+              </div>
+
+              <div className="keypad-grid">
+                {['1', '2', '3', '4', '5', '6', '7', '8', '9'].map((num) => (
+                  <button
+                    key={num}
+                    type="button"
+                    className="keypad-btn"
+                    onClick={() => handleAdminKeypadPress(num)}
+                  >
+                    {num}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  className="keypad-btn action"
+                  style={{ color: '#F44336', borderColor: 'rgba(244,67,54,0.3)' }}
+                  onClick={handleClearAdminPasscode}
+                >
+                  Clear
+                </button>
+                <button
+                  type="button"
+                  className="keypad-btn"
+                  onClick={() => handleAdminKeypadPress('0')}
+                >
+                  0
+                </button>
+                <button
+                  type="submit"
+                  className="keypad-btn action"
+                  style={{ color: 'var(--accent-cyan)', borderColor: 'rgba(0,191,165,0.3)' }}
+                >
+                  Enter
+                </button>
+              </div>
+
+              {adminUnlockError && <div className="lock-err-msg">{adminUnlockError}</div>}
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* 2. PURGE DATA CONFIRMATION MODAL */}
+      {showClearConfirmModal && (
+        <div className="modal-overlay">
+          <div className="modal-card clear-confirm-card">
+            <div className="modal-close-header">
+              <h3 style={{ fontFamily: 'var(--font-title)', color: '#F44336' }}>
+                ⚠️ {clearConfirmType === 'paid' ? 'Clear Sales History' : 'Purge All Database Records'}
+              </h3>
+              <button className="modal-close-x" onClick={() => setShowClearConfirmModal(false)}>×</button>
+            </div>
+            
+            <div className="confirm-body">
+              <p style={{ margin: '12px 0', fontSize: '13px', color: 'var(--text-muted)' }}>
+                {clearConfirmType === 'paid' 
+                  ? 'This will delete all completed (paid) orders from the database. Active new, preparing, or ready orders will remain unaffected.' 
+                  : 'WARNING: This will permanently delete ALL orders (active and completed) from the database. This action is irreversible.'}
+              </p>
+              
+              <p style={{ fontWeight: '700', fontSize: '12px', color: 'var(--text-main)', marginBottom: '8px' }}>
+                Type <span style={{ color: '#F44336', fontFamily: 'var(--font-mono)' }}>CLEAR</span> below to authorize:
+              </p>
+              
+              <input
+                type="text"
+                className="confirm-input-field"
+                placeholder="Type CLEAR here"
+                value={clearConfirmInput}
+                onChange={(e) => setClearConfirmInput(e.target.value)}
+                disabled={isClearing}
+              />
+
+              {adminError && <div className="confirm-error-msg">{adminError}</div>}
+              
+              <div className="confirm-modal-actions">
+                <button 
+                  className="confirm-cancel-btn" 
+                  onClick={() => setShowClearConfirmModal(false)}
+                  disabled={isClearing}
+                >
+                  Cancel
+                </button>
+                <button 
+                  className="confirm-delete-btn"
+                  onClick={handleClearDatabase}
+                  disabled={clearConfirmInput !== 'CLEAR' || isClearing}
+                >
+                  {isClearing ? 'Clearing...' : 'Confirm Purge'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }

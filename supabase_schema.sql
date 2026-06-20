@@ -22,6 +22,7 @@ alter table public.orders enable row level security;
 create policy "Allow public inserts" on public.orders for insert with check (true);
 create policy "Allow public select" on public.orders for select using (true);
 create policy "Allow public update" on public.orders for update using (true);
+create policy "Allow public delete" on public.orders for delete using (true);
 
 -- Enable Realtime for orders table
 begin;
