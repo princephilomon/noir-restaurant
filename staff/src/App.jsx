@@ -156,6 +156,87 @@ const getMergedReadyOrders = (readyOrders) => {
   return getMergedOrdersList(readyOrders);
 };
 
+// Group completed sales history by guest name and payment timestamp (10 mins gap)
+const getMergedSalesHistory = (paidOrdersList) => {
+  const merged = [];
+  
+  // Sort by updated_at descending (most recent checkout first)
+  const sorted = [...paidOrdersList].sort((a, b) => 
+    new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
+  );
+  
+  sorted.forEach(order => {
+    const orderTime = new Date(order.updated_at).getTime();
+    
+    // Find an existing group in 'merged' that matches:
+    // 1. Same guest name (case-insensitive, trimmed)
+    // 2. Difference between this order's checkout time and the group's checkout time is <= 10 minutes (600000 ms)
+    const group = merged.find(g => {
+      const isSameGuest = (g.guest_name || '').toString().trim().toLowerCase() === (order.guest_name || '').toString().trim().toLowerCase();
+      if (!isSameGuest) return false;
+      
+      const groupTime = new Date(g.updated_at).getTime();
+      const timeGap = Math.abs(groupTime - orderTime);
+      return timeGap <= 10 * 60 * 1000; // 10 minutes threshold
+    });
+    
+    if (!group) {
+      merged.push({
+        id: order.id,
+        ids: [order.id],
+        table_number: order.table_number ? order.table_number.toString().trim() : '',
+        table_numbers: order.table_number ? [order.table_number.toString().trim()] : [],
+        guest_name: order.guest_name,
+        created_at: order.created_at,
+        updated_at: order.updated_at,
+        items: JSON.parse(JSON.stringify(order.items || [])),
+        total: order.total || 0,
+        order_no: order.order_no,
+        order_nos: [order.order_no].filter(Boolean),
+        payment_method: order.payment_method,
+        rawOrders: [order]
+      });
+    } else {
+      group.ids.push(order.id);
+      if (order.order_no) {
+        group.order_nos.push(order.order_no);
+      }
+      
+      const tblStr = order.table_number ? order.table_number.toString().trim() : '';
+      if (tblStr && !group.table_numbers.includes(tblStr)) {
+        group.table_numbers.push(tblStr);
+      }
+      group.table_number = group.table_numbers.join(', ');
+      
+      // Merge items list
+      const newItems = order.items || [];
+      newItems.forEach(newItem => {
+        const existingItem = group.items.find(item => item.id === newItem.id);
+        if (existingItem) {
+          existingItem.quantity += newItem.quantity;
+        } else {
+          group.items.push({ ...newItem });
+        }
+      });
+      
+      // Sum totals
+      group.total += (order.total || 0);
+      
+      // Retain earliest created_at for overall visit span
+      if (new Date(order.created_at) < new Date(group.created_at)) {
+        group.created_at = order.created_at;
+      }
+      // Keep latest updated_at for group time reference
+      if (new Date(order.updated_at) > new Date(group.updated_at)) {
+        group.updated_at = order.updated_at;
+      }
+      group.rawOrders.push(order);
+    }
+  });
+  
+  return merged;
+};
+
 function App() {
   // Security Locks
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -185,6 +266,20 @@ function App() {
   const [clearConfirmInput, setClearConfirmInput] = useState('');
   const [adminError, setAdminError] = useState('');
   const [isClearing, setIsClearing] = useState(false);
+
+  // Editing and Merging Sales History State
+  const [selectedHistoryIds, setSelectedHistoryIds] = useState([]);
+  const [editingOrder, setEditingOrder] = useState(null); // single order to edit
+  const [editGuestName, setEditGuestName] = useState('');
+  const [editTableNumber, setEditTableNumber] = useState('');
+  const [editPaymentMethod, setEditPaymentMethod] = useState('online');
+  const [isSavingEdit, setIsSavingEdit] = useState(false);
+
+  const [showMergeConfirmModal, setShowMergeConfirmModal] = useState(false);
+  const [mergeGuestName, setMergeGuestName] = useState('');
+  const [mergeTableNumber, setMergeTableNumber] = useState('');
+  const [mergePaymentMethod, setMergePaymentMethod] = useState('online');
+  const [isMerging, setIsMerging] = useState(false);
   
   const initialFetchDone = useRef(false);
 
@@ -335,6 +430,151 @@ function App() {
       fetchSalesHistory();
     }
   }, [activeView, isAuthenticated]);
+
+  // Editing and Merging Sales History Handlers
+  const handleToggleHistorySelection = (groupId) => {
+    setSelectedHistoryIds(prev => 
+      prev.includes(groupId) 
+        ? prev.filter(id => id !== groupId) 
+        : [...prev, groupId]
+    );
+  };
+
+  const handleToggleAllHistory = (mergedPaidOrdersList) => {
+    if (selectedHistoryIds.length === mergedPaidOrdersList.length) {
+      setSelectedHistoryIds([]);
+    } else {
+      setSelectedHistoryIds(mergedPaidOrdersList.map(o => o.id));
+    }
+  };
+
+  const getSelectedRawOrders = (mergedPaidOrdersList) => {
+    const selectedGroups = mergedPaidOrdersList.filter(o => selectedHistoryIds.includes(o.id));
+    const rawOrders = [];
+    selectedGroups.forEach(g => {
+      if (g.rawOrders) {
+        rawOrders.push(...g.rawOrders);
+      }
+    });
+    return rawOrders;
+  };
+
+  const handleOpenEditModal = (order) => {
+    setEditingOrder(order);
+    setEditGuestName(order.guest_name || '');
+    setEditTableNumber(order.table_number || '');
+    setEditPaymentMethod(order.payment_method || 'online');
+  };
+
+  const handleSaveEdit = async () => {
+    if (!editingOrder) return;
+    setIsSavingEdit(true);
+    try {
+      const targetIds = editingOrder.ids || [editingOrder.id];
+      const { error } = await supabase
+        .from('orders')
+        .update({
+          guest_name: editGuestName,
+          table_number: editTableNumber,
+          payment_method: editPaymentMethod,
+          updated_at: new Date().toISOString()
+        })
+        .in('id', targetIds);
+
+      if (error) throw error;
+      
+      playChime();
+      setEditingOrder(null);
+      fetchSalesHistory();
+    } catch (err) {
+      console.error('Error editing bill:', err);
+      alert('Failed to edit bill: ' + err.message);
+    } finally {
+      setIsSavingEdit(false);
+    }
+  };
+
+  const handleOpenMergeModal = (mergedPaidOrdersList) => {
+    const selectedGroups = mergedPaidOrdersList.filter(o => selectedHistoryIds.includes(o.id));
+    if (selectedGroups.length < 2) {
+      alert("Please select at least 2 bills to merge.");
+      return;
+    }
+    
+    const allTables = Array.from(new Set(selectedGroups.map(g => g.table_number).filter(Boolean)));
+    const allGuests = Array.from(new Set(selectedGroups.map(g => g.guest_name).filter(Boolean)));
+    
+    setMergeGuestName(allGuests.join(' & '));
+    setMergeTableNumber(allTables.join(', '));
+    setMergePaymentMethod(selectedGroups[0].payment_method || 'online');
+    setShowMergeConfirmModal(true);
+  };
+
+  const handleMergePaidOrders = async (mergedPaidOrdersList) => {
+    const selectedRawOrders = getSelectedRawOrders(mergedPaidOrdersList);
+    if (selectedRawOrders.length < 2) return;
+
+    setIsMerging(true);
+    try {
+      const sorted = [...selectedRawOrders].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+      const primaryOrder = sorted[0];
+      const otherOrders = sorted.slice(1);
+      const otherIds = otherOrders.map(o => o.id);
+
+      const mergedItems = JSON.parse(JSON.stringify(primaryOrder.items || []));
+      
+      otherOrders.forEach(order => {
+        const items = order.items || [];
+        items.forEach(newItem => {
+          const existingItem = mergedItems.find(item => item.id === newItem.id);
+          if (existingItem) {
+            existingItem.quantity += newItem.quantity;
+          } else {
+            mergedItems.push({ ...newItem });
+          }
+        });
+      });
+
+      const totalRevenue = selectedRawOrders.reduce((sum, o) => sum + (o.total || 0), 0);
+
+      const uniqueOrderNos = Array.from(new Set(
+        selectedRawOrders.map(o => o.order_no).filter(Boolean)
+      ));
+      const mergedOrderNo = uniqueOrderNos.join(', ');
+
+      const { error: updateError } = await supabase
+        .from('orders')
+        .update({
+          guest_name: mergeGuestName,
+          table_number: mergeTableNumber,
+          payment_method: mergePaymentMethod,
+          items: mergedItems,
+          total: totalRevenue,
+          order_no: mergedOrderNo,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', primaryOrder.id);
+
+      if (updateError) throw updateError;
+
+      const { error: deleteError } = await supabase
+        .from('orders')
+        .delete()
+        .in('id', otherIds);
+
+      if (deleteError) throw deleteError;
+
+      playChime();
+      setSelectedHistoryIds([]);
+      setShowMergeConfirmModal(false);
+      fetchSalesHistory();
+    } catch (err) {
+      console.error('Error merging bills:', err);
+      alert('Failed to merge bills: ' + err.message);
+    } finally {
+      setIsMerging(false);
+    }
+  };
 
   const updateOrderStatus = async (orderIdOrIds, nextStatus) => {
     try {
@@ -498,20 +738,22 @@ function App() {
       doc.setTextColor(142, 117, 84); // Muted gold
       doc.text(`Generated on: ${new Date().toLocaleString()}`, 130, 30);
       
+      const mergedPaid = getMergedSalesHistory(paidOrders);
+
       // Summary Metrics Calculations
-      const totalRevenue = paidOrders.reduce((sum, o) => {
+      const totalRevenue = mergedPaid.reduce((sum, o) => {
         const { total } = getOrderBreakdown(o);
         return sum + total;
       }, 0);
       
-      const totalTips = paidOrders.reduce((sum, o) => {
+      const totalTips = mergedPaid.reduce((sum, o) => {
         const { tipAmount } = getOrderBreakdown(o);
         return sum + tipAmount;
       }, 0);
       
       const netRevenue = totalRevenue - totalTips;
       
-      const totalItemsPrepared = paidOrders.reduce((sum, o) => {
+      const totalItemsPrepared = mergedPaid.reduce((sum, o) => {
         const { foodItems } = getOrderBreakdown(o);
         return sum + foodItems.reduce((s, i) => s + i.quantity, 0);
       }, 0);
@@ -531,7 +773,7 @@ function App() {
         theme: 'plain',
         styles: { fontSize: 10, cellPadding: 4, textColor: [44, 40, 35] },
         body: [
-          ['Total Completed Sales:', `${paidOrders.length} Orders`, 'Active Pending Orders:', `${orders.length} Orders`],
+          ['Total Completed Sales:', `${mergedPaid.length} Transactions`, 'Active Pending Orders:', `${orders.length} Orders`],
           ['Gross Revenue (incl. Tips):', `$${totalRevenue.toFixed(2)}`, 'Tips Collected:', `$${totalTips.toFixed(2)}`],
           ['Net Product Revenue:', `$${netRevenue.toFixed(2)}`, 'Total Items Sold:', `${totalItemsPrepared} items`]
         ],
@@ -549,18 +791,22 @@ function App() {
       doc.line(15, nextY + 3, 195, nextY + 3);
       
       // Prepare table data
-      const tableRows = paidOrders.map((order) => {
+      const tableRows = mergedPaid.map((order) => {
         const { foodItems, tipAmount, total } = getOrderBreakdown(order);
-        const dateStr = new Date(order.created_at).toLocaleDateString();
-        const timeStr = new Date(order.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const dateStr = new Date(order.updated_at).toLocaleDateString();
+        const timeStr = new Date(order.updated_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         
         const itemsStr = foodItems
           .map((item) => `${item.quantity}x ${item.name}`)
           .join(', ');
           
+        const orderNos = order.order_nos && order.order_nos.length > 0 
+          ? order.order_nos.join(', ') 
+          : (order.order_no || 'N/A');
+
         return [
           `${dateStr} ${timeStr}`,
-          order.order_no || 'N/A',
+          orderNos,
           `Table ${order.table_number}`,
           order.guest_name,
           itemsStr,
@@ -1420,141 +1666,222 @@ function App() {
         )}
 
         {/* 3. SALES & TRANSACTION HISTORY VIEW */}
-        {activeView === 'history' && (
-          <div className="history-layout">
+        {activeView === 'history' && (() => {
+            const mergedPaidOrdersList = getMergedSalesHistory(paidOrders);
+            const totalFulfillCount = mergedPaidOrdersList.length;
             
-            {/* Aggregate Dashboard Scores */}
-            <div className="metrics-row">
-              <div className="metric-card">
-                <span className="metric-label">Completed Sales</span>
-                <span className="metric-value">{totalFulfillCount} Orders</span>
-              </div>
-              <div className="metric-card">
-                <span className="metric-label">Total Revenue</span>
-                <span className="metric-value cyan">${totalRevenue.toFixed(2)}</span>
-              </div>
-              <div className="metric-card">
-                <span className="metric-label">Tips Collected</span>
-                <span className="metric-value" style={{ color: 'var(--accent-gold)' }}>
-                  ${totalTips.toFixed(2)}
-                </span>
-              </div>
-            </div>
+            const totalRevenue = mergedPaidOrdersList.reduce((sum, o) => {
+              const { total } = getOrderBreakdown(o);
+              return sum + total;
+            }, 0);
 
-            {/* List Table of transactions */}
-            <div className="history-table-container">
-              <div style={{ marginBottom: '16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <h3 className="column-title">Order Ledger Logs</h3>
-                <button className="lock-out-btn" onClick={fetchSalesHistory}>
-                  🔄 Refresh Logs
-                </button>
-              </div>
+            const totalTips = mergedPaidOrdersList.reduce((sum, o) => {
+              const { tipAmount } = getOrderBreakdown(o);
+              return sum + tipAmount;
+            }, 0);
 
-              {paidOrders.length === 0 ? (
-                <p style={{ textAlign: 'center', padding: '40px 0', color: 'var(--text-muted)' }}>
-                  No transaction records found.
-                </p>
-              ) : (
-                <table className="history-table">
-                  <thead>
-                    <tr>
-                      <th>Time</th>
-                      <th>Order No</th>
-                      <th>Guest</th>
-                      <th>Table</th>
-                      <th>Items Ordered</th>
-                      <th>Subtotal</th>
-                      <th>Tip</th>
-                      <th>Total</th>
-                      <th>Payment</th>
-                      <th>Receipt</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {paidOrders.map((order) => {
-                      const { foodItems, subtotal, tipAmount, total } = getOrderBreakdown(order);
-                      const timeStr = new Date(order.created_at).toLocaleTimeString([], {
-                        hour: '2-digit',
-                        minute: '2-digit',
-                        second: '2-digit'
-                      });
-                      
-                      return (
-                        <tr key={order.id}>
-                          <td style={{ whiteSpace: 'nowrap' }}>
-                            <div>{new Date(order.created_at).toLocaleDateString()}</div>
-                            <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '2px' }}>
-                              {timeStr}
-                            </div>
-                          </td>
-                          <td style={{ fontFamily: 'var(--font-mono)', fontWeight: '700', color: 'var(--accent-gold)' }}>
-                            {order.order_no || 'N/A'}
-                          </td>
-                          <td>{order.guest_name}</td>
-                          <td style={{ fontWeight: '700' }}>T-{order.table_number}</td>
-                          <td>
-                            <div className="history-items-col">
-                              {foodItems.map((item, idx) => (
-                                <div key={idx} style={{ display: 'flex', justifyContent: 'space-between' }}>
-                                  <span>{item.quantity}x {item.name}</span>
-                                </div>
-                              ))}
-                            </div>
-                          </td>
-                          <td style={{ fontFamily: 'var(--font-mono)' }}>${subtotal.toFixed(2)}</td>
-                          <td style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-gold)' }}>
-                            ${tipAmount.toFixed(2)}
-                          </td>
-                          <td style={{ fontFamily: 'var(--font-mono)', fontWeight: '700', color: 'var(--accent-cyan)' }}>
-                            ${total.toFixed(2)}
-                          </td>
-                          <td>
-                            <span className={`payment-badge ${order.payment_method === 'cash' ? 'cash' : 'online'}`}>
-                              {order.payment_method === 'cash' ? '💵 Cash' : '💳 Card'}
-                            </span>
-                          </td>
-                          <td>
-                            <div style={{ display: 'flex', gap: '6px' }}>
-                              <button
-                                type="button"
-                                className="lock-out-btn"
-                                style={{ 
-                                  padding: '4px 8px', 
-                                  fontSize: '11px', 
-                                  borderColor: 'var(--accent-gold)', 
-                                  color: 'var(--accent-gold)',
-                                  fontWeight: '700'
-                                }}
-                                onClick={() => handlePrintBill(order)}
-                              >
-                                🖨️ Print
-                              </button>
-                              <button
-                                type="button"
-                                className="lock-out-btn"
-                                style={{ 
-                                  padding: '4px 8px', 
-                                  fontSize: '11px', 
-                                  borderColor: 'var(--border-color)', 
-                                  color: 'var(--text-muted)',
-                                  fontWeight: '700'
-                                }}
-                                onClick={() => handleDownloadBill(order)}
-                              >
-                                📥 PDF
-                              </button>
-                            </div>
-                          </td>
+            return (
+              <div className="history-layout">
+                
+                {/* Aggregate Dashboard Scores */}
+                <div className="metrics-row">
+                  <div className="metric-card">
+                    <span className="metric-label">Completed Sales</span>
+                    <span className="metric-value">{totalFulfillCount} Transactions</span>
+                  </div>
+                  <div className="metric-card">
+                    <span className="metric-label">Total Revenue</span>
+                    <span className="metric-value cyan">${totalRevenue.toFixed(2)}</span>
+                  </div>
+                  <div className="metric-card">
+                    <span className="metric-label">Tips Collected</span>
+                    <span className="metric-value" style={{ color: 'var(--accent-gold)' }}>
+                      ${totalTips.toFixed(2)}
+                    </span>
+                  </div>
+                </div>
+
+                {/* List Table of transactions */}
+                <div className="history-table-container">
+                  <div style={{ marginBottom: '16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <h3 className="column-title">Order Ledger Logs</h3>
+                    <button className="lock-out-btn" onClick={fetchSalesHistory}>
+                      🔄 Refresh Logs
+                    </button>
+                  </div>
+
+                  {mergedPaidOrdersList.length === 0 ? (
+                    <p style={{ textAlign: 'center', padding: '40px 0', color: 'var(--text-muted)' }}>
+                      No transaction records found.
+                    </p>
+                  ) : (
+                    <table className="history-table">
+                      <thead>
+                        <tr>
+                          <th className="checkbox-cell">
+                            <input 
+                              type="checkbox"
+                              className="custom-checkbox"
+                              checked={mergedPaidOrdersList.length > 0 && selectedHistoryIds.length === mergedPaidOrdersList.length}
+                              onChange={() => handleToggleAllHistory(mergedPaidOrdersList)}
+                            />
+                          </th>
+                          <th>Time</th>
+                          <th>Order No</th>
+                          <th>Guest</th>
+                          <th>Table</th>
+                          <th>Items Ordered</th>
+                          <th>Subtotal</th>
+                          <th>Tip</th>
+                          <th>Total</th>
+                          <th>Payment</th>
+                          <th>Receipt</th>
                         </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              )}
-            </div>
+                      </thead>
+                      <tbody>
+                        {mergedPaidOrdersList.map((order) => {
+                          const { foodItems, subtotal, tipAmount, total } = getOrderBreakdown(order);
+                          const timeStr = new Date(order.updated_at).toLocaleTimeString([], {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                            second: '2-digit'
+                          });
+                          
+                          const orderNos = order.order_nos && order.order_nos.length > 0 
+                            ? order.order_nos.join(', ') 
+                            : (order.order_no || 'N/A');
 
-          </div>
-        )}
+                          return (
+                            <tr key={order.id}>
+                              <td className="checkbox-cell">
+                                <input 
+                                  type="checkbox"
+                                  className="custom-checkbox"
+                                  checked={selectedHistoryIds.includes(order.id)}
+                                  onChange={() => handleToggleHistorySelection(order.id)}
+                                />
+                              </td>
+                              <td style={{ whiteSpace: 'nowrap' }}>
+                                <div>{new Date(order.updated_at).toLocaleDateString()}</div>
+                                <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '2px' }}>
+                                  {timeStr}
+                                </div>
+                              </td>
+                              <td style={{ fontFamily: 'var(--font-mono)', fontWeight: '700', color: 'var(--accent-gold)' }}>
+                                {orderNos}
+                              </td>
+                              <td>{order.guest_name}</td>
+                              <td style={{ fontWeight: '700' }}>
+                                {order.table_numbers && order.table_numbers.length > 0
+                                  ? order.table_numbers.map(t => `T-${t}`).join(', ')
+                                  : (order.table_number ? `T-${order.table_number}` : 'N/A')}
+                              </td>
+                              <td>
+                                <div className="history-items-col">
+                                  {foodItems.map((item, idx) => (
+                                    <div key={idx} style={{ display: 'flex', justifyContent: 'space-between' }}>
+                                      <span>{item.quantity}x {item.name}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </td>
+                              <td style={{ fontFamily: 'var(--font-mono)' }}>${subtotal.toFixed(2)}</td>
+                              <td style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-gold)' }}>
+                                ${tipAmount.toFixed(2)}
+                              </td>
+                              <td style={{ fontFamily: 'var(--font-mono)', fontWeight: '700', color: 'var(--accent-cyan)' }}>
+                                ${total.toFixed(2)}
+                              </td>
+                              <td>
+                                <span className={`payment-badge ${order.payment_method === 'cash' ? 'cash' : 'online'}`}>
+                                  {order.payment_method === 'cash' ? '💵 Cash' : '💳 Card'}
+                                </span>
+                              </td>
+                              <td>
+                                <div style={{ display: 'flex', gap: '6px' }}>
+                                  <button
+                                    type="button"
+                                    className="lock-out-btn"
+                                    style={{ 
+                                      padding: '4px 8px', 
+                                      fontSize: '11px', 
+                                      borderColor: 'var(--accent-gold)', 
+                                      color: 'var(--accent-gold)',
+                                      fontWeight: '700'
+                                    }}
+                                    onClick={() => handlePrintBill(order)}
+                                  >
+                                    🖨️ Print
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="lock-out-btn"
+                                    style={{ 
+                                      padding: '4px 8px', 
+                                      fontSize: '11px', 
+                                      borderColor: 'var(--border-color)', 
+                                      color: 'var(--text-muted)',
+                                      fontWeight: '700'
+                                    }}
+                                    onClick={() => handleDownloadBill(order)}
+                                  >
+                                    📥 PDF
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="lock-out-btn"
+                                    style={{ 
+                                      padding: '4px 8px', 
+                                      fontSize: '11px', 
+                                      borderColor: 'var(--accent-cyan)', 
+                                      color: 'var(--accent-cyan)',
+                                      fontWeight: '700'
+                                    }}
+                                    onClick={() => handleOpenEditModal(order)}
+                                  >
+                                    ✏️ Edit
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+
+                {/* Floating Selection Action Bar */}
+                {selectedHistoryIds.length > 0 && (
+                  <div className="selection-action-bar">
+                    <div className="selection-action-text">
+                      <strong>{selectedHistoryIds.length}</strong> {selectedHistoryIds.length === 1 ? 'bill' : 'bills'} selected
+                    </div>
+                    <div className="selection-action-buttons">
+                      <button
+                        type="button"
+                        className="lock-out-btn"
+                        style={{ borderColor: 'var(--border-color)', color: 'var(--text-muted)' }}
+                        onClick={() => setSelectedHistoryIds([])}
+                      >
+                        Deselect All
+                      </button>
+                      <button
+                        type="button"
+                        className="lock-out-btn"
+                        style={{ borderColor: 'var(--accent-gold)', color: 'var(--accent-gold)' }}
+                        disabled={selectedHistoryIds.length < 2}
+                        onClick={() => handleOpenMergeModal(mergedPaidOrdersList)}
+                      >
+                        {selectedHistoryIds.length < 2 ? 'Select 2+ to Merge' : '🔗 Merge Selected'}
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+              </div>
+            );
+          })()}
 
         {/* 4. ADMIN CONSOLE VIEW */}
         {activeView === 'admin' && isAdmin && (
@@ -1750,6 +2077,214 @@ function App() {
                 </button>
               </div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* 3. EDIT SINGLE COMPLETED BILL MODAL */}
+      {editingOrder && (
+        <div className="modal-overlay">
+          <div className="modal-card" style={{ maxWidth: '450px', width: '90%' }}>
+            <div className="modal-close-header">
+              <h3 style={{ fontFamily: 'var(--font-title)', color: 'var(--accent-cyan)', margin: 0 }}>
+                ✏️ Edit Completed Bill
+              </h3>
+              <button className="modal-close-x" onClick={() => setEditingOrder(null)}>×</button>
+            </div>
+            
+            <div style={{ marginBottom: '16px', fontSize: '12px', color: 'var(--text-muted)', textAlign: 'left' }}>
+              Order No(s): <strong style={{ color: 'var(--accent-gold)' }}>
+                {editingOrder.order_nos ? editingOrder.order_nos.join(', ') : (editingOrder.order_no || 'N/A')}
+              </strong>
+            </div>
+
+            <div className="form-group">
+              <label className="form-label">Guest Name</label>
+              <input
+                type="text"
+                className="form-input"
+                value={editGuestName}
+                onChange={(e) => setEditGuestName(e.target.value)}
+                disabled={isSavingEdit}
+              />
+            </div>
+
+            <div className="form-group">
+              <label className="form-label">Table Assignment</label>
+              <input
+                type="text"
+                className="form-input"
+                value={editTableNumber}
+                onChange={(e) => setEditTableNumber(e.target.value)}
+                disabled={isSavingEdit}
+              />
+            </div>
+
+            <div className="form-group">
+              <label className="form-label">Payment Method</label>
+              <select
+                className="form-select"
+                value={editPaymentMethod}
+                onChange={(e) => setEditPaymentMethod(e.target.value)}
+                disabled={isSavingEdit}
+              >
+                <option value="online">💳 Card / Online</option>
+                <option value="cash">💵 Cash</option>
+              </select>
+            </div>
+
+            <div className="confirm-modal-actions">
+              <button 
+                className="confirm-cancel-btn" 
+                onClick={() => setEditingOrder(null)}
+                disabled={isSavingEdit}
+              >
+                Cancel
+              </button>
+              <button 
+                className="lock-out-btn"
+                style={{ 
+                  flex: 1, 
+                  borderColor: 'var(--accent-cyan)', 
+                  color: 'var(--accent-cyan)',
+                  padding: '12px',
+                  borderRadius: '4px',
+                  fontWeight: '700',
+                  fontSize: '12px'
+                }}
+                onClick={handleSaveEdit}
+                disabled={!editGuestName.trim() || isSavingEdit}
+              >
+                {isSavingEdit ? 'Saving...' : 'Save Changes'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 4. MERGE COMPLETED BILLS MODAL */}
+      {showMergeConfirmModal && (
+        <div className="modal-overlay">
+          <div className="modal-card" style={{ maxWidth: '500px', width: '90%' }}>
+            <div className="modal-close-header">
+              <h3 style={{ fontFamily: 'var(--font-title)', color: 'var(--accent-gold)', margin: 0 }}>
+                🔗 Merge Completed Bills
+              </h3>
+              <button className="modal-close-x" onClick={() => setShowMergeConfirmModal(false)}>×</button>
+            </div>
+
+            {(() => {
+              const mergedPaidOrdersList = getMergedSalesHistory(paidOrders);
+              const selectedRawOrders = getSelectedRawOrders(mergedPaidOrdersList);
+              const totalAmount = selectedRawOrders.reduce((sum, o) => sum + (o.total || 0), 0);
+              
+              const mergedItemsList = [];
+              selectedRawOrders.forEach(order => {
+                (order.items || []).forEach(newItem => {
+                  if (newItem.id !== 'tip' && !newItem.name?.includes('Tip')) {
+                    const existing = mergedItemsList.find(i => i.id === newItem.id);
+                    if (existing) {
+                      existing.quantity += newItem.quantity;
+                    } else {
+                      mergedItemsList.push({ ...newItem });
+                    }
+                  }
+                });
+              });
+
+              return (
+                <div>
+                  <div className="modal-info-title">Bills Being Merged ({selectedRawOrders.length})</div>
+                  <div className="modal-info-box">
+                    {selectedRawOrders.map((order, idx) => (
+                      <div key={order.id || idx} className="modal-info-item">
+                        <span>
+                          {order.order_no || 'N/A'} - {order.guest_name} (T-{order.table_number})
+                        </span>
+                        <span style={{ fontWeight: '700', color: 'var(--accent-cyan)' }}>
+                          ${(order.total || 0).toFixed(2)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="modal-info-title">Merged Items Preview</div>
+                  <div className="modal-info-box" style={{ maxHeight: '120px' }}>
+                    {mergedItemsList.map((item, idx) => (
+                      <div key={item.id || idx} className="modal-info-item">
+                        <span>{item.name}</span>
+                        <span>{item.quantity}x</span>
+                      </div>
+                    ))}
+                    <div className="modal-info-item" style={{ borderTop: '1px solid rgba(255,255,255,0.1)', marginTop: '6px', paddingTop: '6px', fontWeight: '700' }}>
+                      <span>Combined Total Bill:</span>
+                      <span style={{ color: 'var(--accent-gold)' }}>${totalAmount.toFixed(2)}</span>
+                    </div>
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label">Final Guest Name</label>
+                    <input
+                      type="text"
+                      className="form-input"
+                      value={mergeGuestName}
+                      onChange={(e) => setMergeGuestName(e.target.value)}
+                      disabled={isMerging}
+                    />
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label">Final Table Assignment</label>
+                    <input
+                      type="text"
+                      className="form-input"
+                      value={mergeTableNumber}
+                      onChange={(e) => setMergeTableNumber(e.target.value)}
+                      disabled={isMerging}
+                    />
+                  </div>
+
+                  <div className="form-group">
+                    <label className="form-label">Payment Method</label>
+                    <select
+                      className="form-select"
+                      value={mergePaymentMethod}
+                      onChange={(e) => setMergePaymentMethod(e.target.value)}
+                      disabled={isMerging}
+                    >
+                      <option value="online">💳 Card / Online</option>
+                      <option value="cash">💵 Cash</option>
+                    </select>
+                  </div>
+
+                  <div className="confirm-modal-actions">
+                    <button 
+                      className="confirm-cancel-btn" 
+                      onClick={() => setShowMergeConfirmModal(false)}
+                      disabled={isMerging}
+                    >
+                      Cancel
+                    </button>
+                    <button 
+                      className="lock-out-btn"
+                      style={{ 
+                        flex: 1, 
+                        borderColor: 'var(--accent-gold)', 
+                        color: 'var(--accent-gold)',
+                        padding: '12px',
+                        borderRadius: '4px',
+                        fontWeight: '700',
+                        fontSize: '12px'
+                      }}
+                      onClick={() => handleMergePaidOrders(mergedPaidOrdersList)}
+                      disabled={!mergeGuestName.trim() || isMerging}
+                    >
+                      {isMerging ? 'Merging...' : 'Confirm & Merge'}
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         </div>
       )}
