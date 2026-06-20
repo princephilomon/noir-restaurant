@@ -661,6 +661,135 @@ function App() {
     }
   };
 
+  const handlePrintBill = (order) => {
+    if (!order) return;
+    try {
+      const doc = new jsPDF({
+        unit: 'mm',
+        format: 'a6' // 105mm x 148mm
+      });
+      
+      const { foodItems, subtotal, tipAmount, total } = getOrderBreakdown(order);
+      
+      // Header
+      doc.setFillColor(28, 26, 23); // Charcoal
+      doc.rect(0, 0, 105, 22, 'F');
+      
+      doc.setTextColor(197, 168, 128); // Gold
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(16);
+      doc.text('NOIR', 52.5, 9, { align: 'center' });
+      
+      doc.setTextColor(255, 255, 255);
+      doc.setFontSize(7.5);
+      doc.setFont('helvetica', 'normal');
+      doc.text('ELEGANT QR ORDERING', 52.5, 14, { align: 'center' });
+      
+      // Receipt Body Title
+      doc.setTextColor(28, 26, 23);
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(9);
+      doc.text('GUEST BILL & RECEIPT', 52.5, 30, { align: 'center' });
+      
+      doc.setDrawColor(197, 168, 128);
+      doc.setLineWidth(0.3);
+      doc.line(10, 33, 95, 33);
+      
+      // Info section
+      doc.setFontSize(7.5);
+      doc.setFont('helvetica', 'normal');
+      doc.setTextColor(80, 80, 80);
+      
+      const orderNos = order.order_nos ? order.order_nos.join(', ') : (order.order_no || 'N/A');
+      doc.text(`Table: Table ${order.table_number}`, 10, 39);
+      doc.text(`Guest: ${order.guest_name}`, 10, 43);
+      doc.text(`Order No(s): ${orderNos}`, 10, 47);
+      
+      const dateStr = new Date(order.created_at).toLocaleDateString();
+      const timeStr = new Date(order.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      doc.text(`Date: ${dateStr} ${timeStr}`, 10, 51);
+      
+      doc.line(10, 55, 95, 55);
+      
+      // Items list table
+      const itemRows = foodItems.map(item => [
+        `${item.quantity}x`,
+        item.name,
+        `$${(item.price * item.quantity).toFixed(2)}`
+      ]);
+      
+      autoTable(doc, {
+        startY: 57,
+        margin: { left: 10, right: 10 },
+        head: [['Qty', 'Item Description', 'Amount']],
+        body: itemRows,
+        theme: 'plain',
+        headStyles: { fillColor: [245, 239, 235], textColor: [28, 26, 23], fontSize: 7, fontStyle: 'bold' },
+        bodyStyles: { fontSize: 7, textColor: [28, 26, 23] },
+        columnStyles: {
+          0: { cellWidth: 10 },
+          1: { cellWidth: 55 },
+          2: { cellWidth: 20, halign: 'right' }
+        },
+        styles: { cellPadding: 1.5 }
+      });
+      
+      // Totals section
+      const totalsY = doc.lastAutoTable.finalY + 4;
+      doc.setDrawColor(197, 168, 128);
+      doc.line(10, totalsY, 95, totalsY);
+      
+      doc.setFontSize(7.5);
+      doc.setTextColor(28, 26, 23);
+      
+      doc.setFont('helvetica', 'normal');
+      doc.text('Subtotal:', 55, totalsY + 4, { align: 'right' });
+      doc.text(`$${subtotal.toFixed(2)}`, 95, totalsY + 4, { align: 'right' });
+      
+      doc.text('Gratuity/Tip:', 55, totalsY + 8, { align: 'right' });
+      doc.text(`$${tipAmount.toFixed(2)}`, 95, totalsY + 8, { align: 'right' });
+      
+      doc.setFont('helvetica', 'bold');
+      doc.text('Grand Total:', 55, totalsY + 13, { align: 'right' });
+      doc.text(`$${total.toFixed(2)}`, 95, totalsY + 13, { align: 'right' });
+      
+      // Footer
+      const footerY = totalsY + 20;
+      doc.setFont('helvetica', 'italic');
+      doc.setFontSize(6.5);
+      doc.setTextColor(140, 140, 140);
+      doc.text('Thank you for dining with us!', 52.5, footerY, { align: 'center' });
+      doc.text('NOIR - ELEGANT DINING EXPERIENCE', 52.5, footerY + 3, { align: 'center' });
+      
+      // Generate blob URL for print
+      const pdfUrl = doc.output('bloburl');
+      
+      // Print using a hidden iframe
+      const printFrame = document.createElement('iframe');
+      printFrame.style.position = 'fixed';
+      printFrame.style.right = '0';
+      printFrame.style.bottom = '0';
+      printFrame.style.width = '0';
+      printFrame.style.height = '0';
+      printFrame.style.border = '0';
+      printFrame.src = pdfUrl;
+      
+      document.body.appendChild(printFrame);
+      
+      printFrame.onload = () => {
+        printFrame.contentWindow.focus();
+        printFrame.contentWindow.print();
+        setTimeout(() => {
+          document.body.removeChild(printFrame);
+        }, 1000);
+      };
+      
+    } catch (err) {
+      console.error('Error printing bill:', err);
+      alert('Error printing bill: ' + err.message);
+    }
+  };
+
   // Math aggregates for Sales Tab
   const totalFulfillCount = paidOrders.length;
   
@@ -1177,9 +1306,9 @@ function App() {
                         justifyContent: 'center',
                         gap: '6px'
                       }}
-                      onClick={() => handleDownloadBill(selectedOrderForSettle)}
+                      onClick={() => handlePrintBill(selectedOrderForSettle)}
                     >
-                      📄 Bill PDF
+                      🖨️ Print Bill
                     </button>
                     <button
                       className="btn-complete-settlement"
@@ -1295,20 +1424,36 @@ function App() {
                             </span>
                           </td>
                           <td>
-                            <button
-                              type="button"
-                              className="lock-out-btn"
-                              style={{ 
-                                padding: '4px 10px', 
-                                fontSize: '11px', 
-                                borderColor: 'var(--accent-gold)', 
-                                color: 'var(--accent-gold)',
-                                fontWeight: '700'
-                              }}
-                              onClick={() => handleDownloadBill(order)}
-                            >
-                              📥 PDF
-                            </button>
+                            <div style={{ display: 'flex', gap: '6px' }}>
+                              <button
+                                type="button"
+                                className="lock-out-btn"
+                                style={{ 
+                                  padding: '4px 8px', 
+                                  fontSize: '11px', 
+                                  borderColor: 'var(--accent-gold)', 
+                                  color: 'var(--accent-gold)',
+                                  fontWeight: '700'
+                                }}
+                                onClick={() => handlePrintBill(order)}
+                              >
+                                🖨️ Print
+                              </button>
+                              <button
+                                type="button"
+                                className="lock-out-btn"
+                                style={{ 
+                                  padding: '4px 8px', 
+                                  fontSize: '11px', 
+                                  borderColor: 'var(--border-color)', 
+                                  color: 'var(--text-muted)',
+                                  fontWeight: '700'
+                                }}
+                                onClick={() => handleDownloadBill(order)}
+                              >
+                                📥 PDF
+                              </button>
+                            </div>
                           </td>
                         </tr>
                       );
