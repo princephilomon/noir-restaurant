@@ -274,6 +274,7 @@ function App() {
   const [editTableNumber, setEditTableNumber] = useState('');
   const [editPaymentMethod, setEditPaymentMethod] = useState('online');
   const [isSavingEdit, setIsSavingEdit] = useState(false);
+  const [mergeTargetGroupId, setMergeTargetGroupId] = useState('');
 
   const [showMergeConfirmModal, setShowMergeConfirmModal] = useState(false);
   const [mergeGuestName, setMergeGuestName] = useState('');
@@ -464,6 +465,7 @@ function App() {
     setEditGuestName(order.guest_name || '');
     setEditTableNumber(order.table_number || '');
     setEditPaymentMethod(order.payment_method || 'online');
+    setMergeTargetGroupId('');
   };
 
   const handleSaveEdit = async () => {
@@ -507,6 +509,19 @@ function App() {
     setMergeGuestName(allGuests.join(' & '));
     setMergeTableNumber(allTables.join(', '));
     setMergePaymentMethod(selectedGroups[0].payment_method || 'online');
+    setShowMergeConfirmModal(true);
+  };
+
+  const handleOpenMergeModalForTwo = (orderA, orderB) => {
+    const allGuests = [orderA.guest_name, orderB.guest_name].filter(Boolean);
+    const allTables = [orderA.table_number, orderB.table_number].filter(Boolean);
+    
+    const uniqueGuests = Array.from(new Set(allGuests));
+    const uniqueTables = Array.from(new Set(allTables));
+    
+    setMergeGuestName(uniqueGuests.join(' & '));
+    setMergeTableNumber(uniqueTables.join(', '));
+    setMergePaymentMethod(orderA.payment_method || 'online');
     setShowMergeConfirmModal(true);
   };
 
@@ -1705,9 +1720,26 @@ function App() {
                 <div className="history-table-container">
                   <div style={{ marginBottom: '16px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <h3 className="column-title">Order Ledger Logs</h3>
-                    <button className="lock-out-btn" onClick={fetchSalesHistory}>
-                      🔄 Refresh Logs
-                    </button>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                      <button 
+                        type="button"
+                        className="lock-out-btn" 
+                        style={{ 
+                          borderColor: selectedHistoryIds.length >= 2 ? 'var(--accent-gold)' : 'var(--border-color)', 
+                          color: selectedHistoryIds.length >= 2 ? 'var(--accent-gold)' : 'var(--text-muted)',
+                          opacity: selectedHistoryIds.length >= 2 ? 1 : 0.6,
+                          fontWeight: '700'
+                        }}
+                        disabled={selectedHistoryIds.length < 2}
+                        onClick={() => handleOpenMergeModal(mergedPaidOrdersList)}
+                        title="Select 2 or more checkboxes in the table to merge"
+                      >
+                        🔗 Merge Selected Bills {selectedHistoryIds.length > 0 ? `(${selectedHistoryIds.length})` : ''}
+                      </button>
+                      <button className="lock-out-btn" onClick={fetchSalesHistory}>
+                        🔄 Refresh Logs
+                      </button>
+                    </div>
                   </div>
 
                   {mergedPaidOrdersList.length === 0 ? (
@@ -2132,6 +2164,52 @@ function App() {
                 <option value="cash">💵 Cash</option>
               </select>
             </div>
+
+            {(() => {
+              const mergedPaidOrdersList = getMergedSalesHistory(paidOrders);
+              const otherCompletedGroups = mergedPaidOrdersList.filter(g => g.id !== editingOrder.id);
+              return (
+                <div style={{ borderTop: '1px solid var(--border-color)', marginTop: '20px', paddingTop: '16px' }}>
+                  <label className="form-label" style={{ color: 'var(--accent-gold)', marginBottom: '8px', display: 'block' }}>
+                    🔗 Merge this bill with another completed bill
+                  </label>
+                  <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                    <select
+                      className="form-select"
+                      value={mergeTargetGroupId}
+                      onChange={(e) => setMergeTargetGroupId(e.target.value)}
+                      style={{ flex: 1 }}
+                    >
+                      <option value="">-- Select Bill to Merge --</option>
+                      {otherCompletedGroups.map(group => {
+                        const timeStr = new Date(group.updated_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                        return (
+                          <option key={group.id} value={group.id}>
+                            {group.guest_name} (T-{group.table_number}) - ${group.total.toFixed(2)} - {timeStr}
+                          </option>
+                        );
+                      })}
+                    </select>
+                    <button
+                      type="button"
+                      className="lock-out-btn"
+                      style={{ borderColor: 'var(--accent-gold)', color: 'var(--accent-gold)', whiteSpace: 'nowrap', padding: '10px 14px' }}
+                      disabled={!mergeTargetGroupId}
+                      onClick={() => {
+                        const targetGroup = otherCompletedGroups.find(g => g.id === mergeTargetGroupId);
+                        if (targetGroup) {
+                          setSelectedHistoryIds([editingOrder.id, targetGroup.id]);
+                          setEditingOrder(null);
+                          handleOpenMergeModalForTwo(editingOrder, targetGroup);
+                        }
+                      }}
+                    >
+                      Merge
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
 
             <div className="confirm-modal-actions">
               <button 
